@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+# ══════════════════════════════════════════════════════════════════
+#  shocks5 — SOCKS5 Proxy Installer + Runner
+#  Repo  : https://github.com/geminidarkai-tech/shocks5python
+#  Usage :
+#    Install & start  : bash shocks5 install [PORT]
+#    Start only       : bash shocks5 start   [PORT]
+#    Stop             : bash shocks5 stop
+#    Status           : bash shocks5 status
+#    Uninstall        : bash shocks5 uninstall
+#    Logs             : bash shocks5 log
+#
+#  One-liner dari GitHub:
+#    curl -fsSL https://raw.githubusercontent.com/geminidarkai-tech/shocks5python/main/shocks5 | bash -s install 28352
+# ══════════════════════════════════════════════════════════════════
+
+set -e
+
+# ─── KONFIGURASI ─────────────────────────────────────────────────
+ACTION="${1:-install}"
+PORT="${2:-28352}"
+PROXY_BIN="/usr/local/bin/socksproxy.py"
+SERVICE_NAME="socksproxy"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+INIT_SCRIPT="/etc/init.d/${SERVICE_NAME}"
+LOG_FILE="/tmp/socks.log"
+SYMLINK="/etc/systemd/system/multi-user.target.wants/${SERVICE_NAME}.service"
+
+# Deteksi init system otomatis
+HAS_SYSTEMD=0
+if command -v systemctl &>/dev/null && [ -d /etc/systemd/system ]; then
+    HAS_SYSTEMD=1
+fi
+# ─────────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+info()    { echo -e "${GREEN}[INFO]${NC}  $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+
+need_root() { [ "$(id -u)" -eq 0 ] || error "Jalankan sebagai root: sudo bash $0 $*"; }
+
+# ══════════════════════════════════════════════════════════════════
+write_proxy() {
+# Tulis file Python proxy ke $PROXY_BIN
+info "Menulis proxy ke $PROXY_BIN ..."
+cat > "$PROXY_BIN" << 'PYEOF'
+#!/usr/bin/env python3
+"""
+SOCKS5 Proxy - Production Grade
+- recv_exact()        : anti-fragmentasi TCP
+- MAX_CONNECTIONS     : batas koneksi simultan
+- Rate limiting       : anti-scanner/abuse per IP
+- Idle timeout        : tutup koneksi zombie otomatis
+- TCP keepalive       : deteksi koneksi mati lebih cepat
+- Log rotation        : RotatingFileHandler (tidak log ganda ke systemd)
+- Graceful shutdown   : SIGTERM / SIGINT
+- Auto-restart        : loop di main() jika server crash
+"""
+
+import socket, threading, sys, time, signal, logging, traceback
+from logging.handlers import RotatingFileHandler
+from collections import defaultdict
+
+# ─── KONFIGURASI ─────────────────────────────────────────────────
+PORT              = int(sys.argv[1]) if len(sys.argv) > 1 else 28352
+BIND_ADDR         = '0.0.0.0'
+CONNECT_TIMEOUT   = 10       # timeout connect ke target (detik)
+MAX_CONNECTIONS   = 200      # maks koneksi simultan
+BACKLOG           = 100      # antrian accept()
+IDLE_TIMEOUT      = 900      # tutup koneksi bila idle > 15 menit
+RATE_LIMIT_COUNT  = 20       # maks koneksi baru per IP per window
+RATE_LIMIT_WINDOW = 60       # window (detik)
+RATE_LIMIT_BLOCK  = 300      # durasi blokir IP (detik)
+LOG_FILE          = '/tmp/socks.log'
+LOG_MAX_BYTES     = 5 * 1024 * 1024
+LOG_BACKUP_COUNT  = 3
+STATUS_INTERVAL   = 300      # log status koneksi aktif tiap 5 menit
+# ─────────────────────────────────────────────────────────────────
+
+def setup_logger():
+    logger = logging.getLogger('socks5')
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter('[%(asctime)s] %(levelname)s %(message)s',
+                            datefmt='%Y-%m-%d %H:%M:%S')
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES,
+                             backupCount=LOG_BACKUP_COUNT)
+    fh.setFormatter(fmt)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+log = setup_logger()
+
+_shutdown       = threading.Event()
+_conn_sem       = threading.Semaphore(MAX_CONNECTIONS)
+_active_conns   = 0
+_active_lock    = threading.Lock()
+_rate_data      = defaultdict(list)
+_rate_lock      = threading.Lock()
+_blocked_ips    = {}
+_blocked_lock   = threading.Lock()
+
+
+def recv_exact(sock, n):
+    buf = b''
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError(f"closed early (need {n}, got {len(buf)})")
+        buf += chunk
+    return buf
+
+
+def set_keepalive(sock):
+    """Keepalive agresif — deteksi koneksi mati dalam ~75 detik."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,  60)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT,    4)
+    except (AttributeError, OSError):
+        pass
+
+
+def is_rate_limited(ip):
+    now = time.time()
+    with _blocked_lock:
+        if ip in _blocked_ips:
+            if now < _blocked_ips[ip]:
+                return True
+            del _blocked_ips[ip]
+    with _rate_lock:
+        ts = _rate_data[ip]
+        ts = [t for t in ts if now - t < RATE_LIMIT_WINDOW]
+        ts.append(now)
+        _rate_data[ip] = ts
+        if len(ts) > RATE_LIMIT_COUNT:
+            with _blocked_lock:
+                _blocked_ips[ip] = now + RATE_LIMIT_BLOCK
+            log.warning(f"Rate-limit: {ip} diblokir {RATE_LIMIT_BLOCK}s "
+                        f"({len(ts)} koneksi/{RATE_LIMIT_WINDOW}s)")
+            return True
+    return False
+
+
+def cleanup_loop():
+    last = time.time()
+    while not _shutdown.is_set():
+        _shutdown.wait(60)
+        now = time.time()
+        with _rate_lock:
+            for ip in list(_rate_data):
+                _rate_data[ip] = [t for t in _rate_data[ip]
+                                  if now - t < RATE_LIMIT_WINDOW]
+                if not _rate_data[ip]:
+                    del _rate_data[ip]
+        with _blocked_lock:
+            for ip in list(_blocked_ips):
+                if now >= _blocked_ips[ip]:
+                    del _blocked_ips[ip]
+        if now - last >= STATUS_INTERVAL:
+            with _active_lock:
+                log.info(f"Status: {_active_conns}/{MAX_CONNECTIONS} koneksi aktif")
+            last = now
+
+
+def pipe(src, dst, activity):
+    """Forward data satu arah dengan idle-timeout dan send-timeout terpisah."""
+    try:
+        while not _shutdown.is_set():
+            src.settimeout(1.0)
+            try:
+                data = src.recv(4096)
+            except socket.timeout:
+                if time.time() - activity[0] > IDLE_TIMEOUT:
+                    log.debug(f"Idle timeout {IDLE_TIMEOUT}s — tutup koneksi")
+                    break
+                continue
+            if not data:
+                break
+            activity[0] = time.time()
+            try:
+                dst.settimeout(30)   # timeout kirim lebih longgar dari recv
+                dst.sendall(data)
+            except socket.timeout:
+                log.debug("Send timeout — tujuan lambat/macet")
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+
+
+def handle_client(client, addr):
+    global _active_conns
+    ip, remote = addr[0], None
+
+    if not _conn_sem.acquire(blocking=False):
+        log.warning(f"Tolak {ip}: maks koneksi ({MAX_CONNECTIONS}) tercapai")
+        client.close()
+        return
+
+    with _active_lock:
+        _active_conns += 1
+
+    try:
+        client.settimeout(CONNECT_TIMEOUT)
+
+        # ── Handshake ────────────────────────────────────────────
+        ver, nmethods = recv_exact(client, 2)
+        if ver != 5:
+            return
+        recv_exact(client, nmethods)
+        client.sendall(b'\x05\x00')
+
+        # ── Request ──────────────────────────────────────────────
+        ver, cmd, _, atyp = recv_exact(client, 4)
+        if cmd != 1:
+            client.sendall(b'\x05\x07\x00\x01' + b'\x00' * 6)
+            return
+
+        if   atyp == 1:
+            target = socket.inet_ntoa(recv_exact(client, 4))
+        elif atyp == 3:
+            target = recv_exact(client, recv_exact(client, 1)[0]).decode(errors='replace')
+        elif atyp == 4:
+            target = socket.inet_ntop(socket.AF_INET6, recv_exact(client, 16))
+        else:
+            client.sendall(b'\x05\x08\x00\x01' + b'\x00' * 6)
+            return
+
+        port = int.from_bytes(recv_exact(client, 2), 'big')
+
+        # ── Connect ke target ─────────────────────────────────────
+        try:
+            fam    = socket.AF_INET6 if atyp == 4 else socket.AF_INET
+            remote = socket.socket(fam, socket.SOCK_STREAM)
+            remote.settimeout(CONNECT_TIMEOUT)
+            remote.connect((target, port))
+            remote.settimeout(None)
+        except Exception as e:
+            log.debug(f"Gagal connect {target}:{port} dari {ip}: {e}")
+            client.sendall(b'\x05\x05\x00\x01' + b'\x00' * 6)
+            return
+
+        set_keepalive(client)
+        set_keepalive(remote)
+
+        client.sendall(b'\x05\x00\x00\x01' +
+                       socket.inet_aton('0.0.0.0') + (0).to_bytes(2, 'big'))
+        client.settimeout(None)
+
+        activity = [time.time()]
+        t1 = threading.Thread(target=pipe, args=(client, remote, activity), daemon=True)
+        t2 = threading.Thread(target=pipe, args=(remote, client, activity), daemon=True)
+        t1.start(); t2.start()
+        t1.join();  t2.join()
+
+    except Exception as e:
+        log.debug(f"handle_client ({ip}): {e}")
+    finally:
+        for s in (client, remote):
+            try:
+                s and s.close()
+            except Exception:
+                pass
+        _conn_sem.release()
+        with _active_lock:
+            _active_conns -= 1
+
+
+def run_server():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((BIND_ADDR, PORT))
+    srv.listen(BACKLOG)
+    srv.settimeout(1.0)
+    log.info(f"SOCKS5 jalan di {BIND_ADDR}:{PORT} | "
+             f"maks {MAX_CONNECTIONS} koneksi | idle {IDLE_TIMEOUT}s | "
+             f"rate-limit {RATE_LIMIT_COUNT}/{RATE_LIMIT_WINDOW}s per IP")
+
+    threading.Thread(target=cleanup_loop, daemon=True).start()
+
+    try:
+        while not _shutdown.is_set():
+            try:
+                client, addr = srv.accept()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if not _shutdown.is_set():
+                    log.error(f"Accept error: {e}")
+                    time.sleep(1)
+                continue
+            if is_rate_limited(addr[0]):
+                client.close()
+                continue
+            threading.Thread(target=handle_client, args=(client, addr),
+                             daemon=True).start()
+    finally:
+        srv.close()
+        log.info("Server berhenti.")
+
+
+def main():
+    def _sig(s, f):
+        log.info(f"Sinyal {s} — shutdown...")
+        _shutdown.set()
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT,  _sig)
+
+    while not _shutdown.is_set():
+        try:
+            run_server()
+        except Exception as e:
+            if not _shutdown.is_set():
+                log.error(f"Fatal — restart 3 detik: {e}\n{traceback.format_exc()}")
+                time.sleep(3)
+    log.info("Proxy selesai.")
+
+if __name__ == '__main__':
+    main()
+PYEOF
+    chmod +x "$PROXY_BIN"
+}
+
+# ══════════════════════════════════════════════════════════════════
+write_service() {
+if [ "$HAS_SYSTEMD" -eq 1 ]; then
+    info "Menulis systemd service ke $SERVICE_FILE ..."
+    cat > "$SERVICE_FILE" << SVCEOF
+[Unit]
+Description=SOCKS5 Proxy (port ${PORT})
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 ${PROXY_BIN} ${PORT}
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+else
+    info "Systemd tidak ada — menulis SysV init script ke $INIT_SCRIPT ..."
+    # Cari python3 yang tersedia
+    PYTHON_BIN=$(command -v python3 || command -v python || echo "/usr/bin/python")
+    cat > "$INIT_SCRIPT" << INITEOF
+#!/bin/bash
+# chkconfig: 2345 90 10
+# description: SOCKS5 Proxy (port ${PORT})
+PROXY_BIN="${PROXY_BIN}"
+PYTHON="${PYTHON_BIN}"
+PORT="${PORT}"
+LOG="${LOG_FILE}"
+PIDFILE="/var/run/${SERVICE_NAME}.pid"
+
+start() {
+    if [ -f "\$PIDFILE" ] && kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
+        echo "socksproxy sudah jalan (PID \$(cat \$PIDFILE))"
+        return 0
+    fi
+    echo -n "Menjalankan socksproxy..."
+    nohup \$PYTHON \$PROXY_BIN \$PORT >> \$LOG 2>&1 &
+    echo \$! > "\$PIDFILE"
+    sleep 1
+    if kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
+        echo " OK (PID \$(cat \$PIDFILE))"
+    else
+        echo " GAGAL — cek \$LOG"
+        rm -f "\$PIDFILE"
+        return 1
+    fi
+}
+
+stop() {
+    echo -n "Menghentikan socksproxy..."
+    if [ -f "\$PIDFILE" ]; then
+        kill \$(cat "\$PIDFILE") 2>/dev/null && rm -f "\$PIDFILE"
+    fi
+    pkill -f "socksproxy.py" 2>/dev/null || true
+    echo " OK"
+}
+
+status() {
+    if [ -f "\$PIDFILE" ] && kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
+        echo "socksproxy jalan (PID \$(cat \$PIDFILE))"
+    else
+        echo "socksproxy tidak jalan"
+        return 1
+    fi
+}
+
+case "\$1" in
+    start)   start  ;;
+    stop)    stop   ;;
+    restart) stop; sleep 1; start ;;
+    status)  status ;;
+    *)       echo "Usage: \$0 {start|stop|restart|status}" ;;
+esac
+INITEOF
+    chmod +x "$INIT_SCRIPT"
+fi
+}
+
+# ══════════════════════════════════════════════════════════════════
+enable_service() {
+if [ "$HAS_SYSTEMD" -eq 1 ]; then
+    # Pakai symlink manual karena systemctl enable bisa gagal kalau polkit/dbus error
+    info "Mengaktifkan service saat boot (systemd symlink) ..."
+    mkdir -p "$(dirname "$SYMLINK")"
+    ln -sf "$SERVICE_FILE" "$SYMLINK"
+else
+    info "Mengaktifkan service saat boot (SysV chkconfig) ..."
+    if command -v chkconfig &>/dev/null; then
+        chkconfig --add "$SERVICE_NAME" 2>/dev/null || true
+        chkconfig "$SERVICE_NAME" on 2>/dev/null || true
+    fi
+    # Fallback: tambah ke rc.local juga supaya pasti jalan
+    RC_LOCAL="/etc/rc.local"
+    [ -f "$RC_LOCAL" ] || RC_LOCAL="/etc/rc.d/rc.local"
+    PYTHON_BIN=$(command -v python3 || command -v python || echo "/usr/bin/python")
+    if ! grep -q "socksproxy" "$RC_LOCAL" 2>/dev/null; then
+        sed -i 's|^exit 0||' "$RC_LOCAL" 2>/dev/null || true
+        echo "nohup ${PYTHON_BIN} ${PROXY_BIN} ${PORT} >> ${LOG_FILE} 2>&1 &" >> "$RC_LOCAL"
+        echo "exit 0" >> "$RC_LOCAL"
+        info "Ditambahkan ke $RC_LOCAL sebagai fallback"
+    fi
+fi
+}
+
+# ══════════════════════════════════════════════════════════════════
+open_firewall() {
+    info "Membuka port $PORT di iptables ..."
+    # Cek apakah rule sudah ada supaya tidak duplikat
+    iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT
+
+    # Simpan rule — coba dua cara (CentOS vs Debian)
+    if command -v service &>/dev/null && service iptables save &>/dev/null 2>&1; then
+        info "iptables rules disimpan via service iptables save"
+    elif command -v iptables-save &>/dev/null; then
+        if [ -f /etc/sysconfig/iptables ]; then
+            iptables-save > /etc/sysconfig/iptables
+            info "iptables rules disimpan ke /etc/sysconfig/iptables"
+        elif [ -d /etc/iptables ]; then
+            iptables-save > /etc/iptables/rules.v4
+            info "iptables rules disimpan ke /etc/iptables/rules.v4"
+        fi
+    fi
+}
+
+# ══════════════════════════════════════════════════════════════════
+start_proxy() {
+    # Hentikan proses lama kalau ada
+    pkill -f "socksproxy.py" 2>/dev/null || true
+    sleep 1
+
+    PYTHON_BIN=$(command -v python3 || command -v python || echo "/usr/bin/python")
+
+    if [ "$HAS_SYSTEMD" -eq 1 ] && systemctl start "$SERVICE_NAME" 2>/dev/null; then
+        info "Service dimulai via systemctl"
+    elif [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" start 2>/dev/null; then
+        info "Service dimulai via SysV init script"
+    else
+        warn "Fallback ke nohup ..."
+        nohup "$PYTHON_BIN" "$PROXY_BIN" "$PORT" >> "$LOG_FILE" 2>&1 &
+        sleep 1
+        if pgrep -f "socksproxy.py" > /dev/null; then
+            info "Proxy berjalan via nohup (PID: $(pgrep -f socksproxy.py))"
+        else
+            error "Proxy gagal dijalankan. Cek: $LOG_FILE"
+        fi
+    fi
+}
+
+# ══════════════════════════════════════════════════════════════════
+verify() {
+    sleep 2
+    info "Verifikasi proxy ..."
+    if curl -s --max-time 5 --socks5 "127.0.0.1:$PORT" http://ipinfo.io/ip 2>/dev/null; then
+        echo ""
+        info "✅ Proxy SOCKS5 berjalan dengan baik di port $PORT"
+    else
+        warn "curl test gagal — cek log: tail -f $LOG_FILE"
+    fi
+}
+
+# ══════════════════════════════════════════════════════════════════
+#  ACTIONS
+# ══════════════════════════════════════════════════════════════════
+case "$ACTION" in
+
+install)
+    need_root
+    info "=== Instalasi SOCKS5 Proxy (port $PORT) ==="
+    write_proxy
+    write_service
+    enable_service
+    open_firewall
+    start_proxy
+    verify
+    info "=== Selesai ==="
+    info "Log    : tail -f $LOG_FILE"
+    info "Status : bash $0 status"
+    ;;
+
+start)
+    need_root
+    write_proxy
+    write_service
+    start_proxy
+    verify
+    ;;
+
+stop)
+    need_root
+    info "Menghentikan proxy ..."
+    [ "$HAS_SYSTEMD" -eq 1 ] && systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop 2>/dev/null || true
+    pkill -f "socksproxy.py" 2>/dev/null || true
+    info "Proxy dihentikan."
+    ;;
+
+status)
+    echo ""
+    if [ "$HAS_SYSTEMD" -eq 1 ]; then
+        echo "── Systemd service ──────────────────────────────────"
+        systemctl status "$SERVICE_NAME" 2>/dev/null || echo "(tidak ada service)"
+    elif [ -x "$INIT_SCRIPT" ]; then
+        echo "── SysV init service ────────────────────────────────"
+        "$INIT_SCRIPT" status 2>/dev/null || echo "(tidak jalan)"
+    fi
+    echo ""
+    echo "── Proses aktif ─────────────────────────────────────"
+    pgrep -a -f socksproxy.py 2>/dev/null || echo "(tidak ada proses)"
+    echo ""
+    echo "── Koneksi di port $PORT ──────────────────────────────"
+    ss -tnp 2>/dev/null | grep ":$PORT" || \
+      netstat -tnp 2>/dev/null | grep ":$PORT" || echo "(tidak ada)"
+    echo ""
+    echo "── Log terakhir ─────────────────────────────────────"
+    tail -20 "$LOG_FILE" 2>/dev/null || echo "(log kosong)"
+    ;;
+
+log)
+    tail -f "$LOG_FILE" 2>/dev/null || echo "Log belum ada: $LOG_FILE"
+    ;;
+
+uninstall)
+    need_root
+    info "Menghapus SOCKS5 Proxy ..."
+    [ "$HAS_SYSTEMD" -eq 1 ] && systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    [ -x "$INIT_SCRIPT" ] && "$INIT_SCRIPT" stop 2>/dev/null || true
+    pkill -f "socksproxy.py" 2>/dev/null || true
+    # Hapus SysV dari chkconfig
+    command -v chkconfig &>/dev/null && chkconfig "$SERVICE_NAME" off 2>/dev/null || true
+    # Hapus dari rc.local
+    for RC in /etc/rc.local /etc/rc.d/rc.local; do
+        [ -f "$RC" ] && sed -i '/socksproxy/d' "$RC"
+    done
+    # Hapus files
+    rm -f "$PROXY_BIN" "$SERVICE_FILE" "$SYMLINK" "$INIT_SCRIPT"
+    # Hapus rule iptables
+    iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+    service iptables save 2>/dev/null || \
+      iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+    info "Uninstall selesai."
+    ;;
+
+*)
+    echo "Usage: bash $0 {install|start|stop|status|log|uninstall} [PORT]"
+    echo "Default PORT: 28352"
+    exit 1
+    ;;
+esac
