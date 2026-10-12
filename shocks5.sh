@@ -1,11 +1,3 @@
-Untuk menyembunyikan file-file proxy agar tidak berada di folder /root dan lebih menyatu dengan sistem, kita bisa menaruhnya di dalam folder tersembunyi di direktori /opt (direktori standar Linux untuk software tambahan).
-
-Dalam skrip modifikasi ini, sistem akan otomatis membuat folder tersembunyi di /opt/.sys_proxy/ dan meletakkan seluruh file core Python serta watchdog-nya di sana.
-
-Silakan copy-paste perintah berikut di terminal Anda untuk membuat installer.sh yang baru:
-
-Bash
-cat << 'INSTALLEREOF' > installer.sh
 #!/bin/bash
 
 clear
